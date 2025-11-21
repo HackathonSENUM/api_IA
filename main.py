@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware  # ← AJOUT IMPORTA
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from rumor_engine import (
@@ -24,6 +25,16 @@ app = FastAPI(
     """,
     version="1.0.0"
 )
+
+# 🔥 Middleware CORS — À NE SURTOUT PAS OUBLIER
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # ou mets ton domaine pour limiter : ["https://monfrontend.com"]
+    allow_credentials=True,
+    allow_methods=["*"],  # Autorise OPTIONS (résout ton erreur 405)
+    allow_headers=["*"],
+)
+
 
 # ----------------------------
 # Models
