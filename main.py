@@ -7,7 +7,7 @@ from rumor_engine import (
     RumorExtractor,
     RumorDeduplicator,
     ViralityScorer,
-    FactChecker,
+    ImprovedFactChecker as FactChecker,
     Config
 )
 

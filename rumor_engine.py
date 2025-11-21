@@ -486,159 +486,359 @@ class WebSearcher:
 # ==========================================
 # FACT CHECKER
 # ==========================================
-class FactChecker:
-    """Vérifie les rumeurs avec des sources FIABLES"""
+from bs4 import BeautifulSoup
+class ImprovedFactChecker:
+    """Fact-checker avec fetch complet des pages et analyse Gemini intelligente"""
     
-    def __init__(self, api_key: str, searcher: WebSearcher):
-        self.api_key = api_key
+    def __init__(self, api_key: Optional[str], searcher):
+        self.api_key = os.getenv("GEMINI_API_KEY", "")
         self.searcher = searcher
-        if GEMINI_AVAILABLE and api_key:
-            genai.configure(api_key=api_key)
+        
+        if not api_key:
+            logging.error("❌ GEMINI_API_KEY manquante - Vérification impossible!")
+            self.gemini_available = False
+        elif not GEMINI_AVAILABLE:
+            logging.error("❌ Module google.generativeai non installé!")
+            self.gemini_available = False
+        else:
+            try:
+                genai.configure(api_key=api_key)
+                self.gemini_available = True
+                logging.info("✅ Gemini configuré et prêt")
+            except Exception as e:
+                logging.error(f"❌ Erreur configuration Gemini: {e}")
+                self.gemini_available = False
+    
+    # ==========================================
+    # ÉTAPE 1: RECHERCHE DE SOURCES FIABLES
+    # ==========================================
     
     def find_trusted_sources(self, rumor_text: str) -> List[Dict]:
-        """Cherche des infos sur la rumeur sur les sites fiables"""
-        keywords = rumor_text.split()[:6]
-        # Utiliser TOUS les domaines fiables (pas seulement les 5 premiers)
-        trusted_domains = " OR ".join([f"site:{d}" for d in Config.TRUSTED_SOURCES])
-        query = f'{" ".join(keywords)} ({trusted_domains})'
-
-        logging.info(f"   🔍 Recherche sur sources fiables (requête): {query[:200]}...")
-
-        # Requête principale: demander davantage de résultats pour augmenter les chances
-        results = self.searcher.search(query, num_results=20)
-
-        # Loguer les résultats reçus (quelques éléments) pour diagnostic
-        if results:
-            logging.info(f"   ℹ️  {len(results)} résultats reçus de l'API de recherche (examining up to 10)")
-            for idx, r in enumerate(results[:10], 1):
-                logging.debug(f"      Result {idx}: domain={domain_of_url(r.get('link',''))} title={r.get('title','')[:80]} snippet={r.get('snippet','')[:120]}")
-
-        trusted_results = []
-        for r in results:
-            domain = domain_of_url(r.get("link", ""))
-            if domain in Config.TRUSTED_SOURCES:
-                trusted_results.append(r)
-
-        logging.info(f"   📰 {len(trusted_results)} sources fiables trouvées (après filtrage)")
-
-        # Si aucune source fiable trouvée, faire une recherche secondaire plus large
-        if not trusted_results:
-            logging.info("   🔎 Aucune source fiable directe trouvée — tentative de recherche secondaire élargie...")
-            # Chercher indices explicites de confirmation/démenti dans des snippets
-            intent_terms = "démenti OR dément OR faux OR " \
-                           "confirmé OR officiel OR communiqué OR \"mise au point\""
-            secondary_query = f'{" ".join(keywords)} ({intent_terms})'
-            logging.info(f"   🔍 Secondary query: {secondary_query[:200]}...")
-            secondary_results = self.searcher.search(secondary_query, num_results=20)
-
-            if secondary_results:
-                logging.info(f"   ℹ️  {len(secondary_results)} résultats secondaires reçus")
-                for idx, r in enumerate(secondary_results[:10], 1):
-                    logging.debug(f"      Sec {idx}: domain={domain_of_url(r.get('link',''))} title={r.get('title','')[:80]} snippet={r.get('snippet','')[:120]}")
-
-                # Retourner ces résultats même s'ils ne proviennent pas de la whitelist
-                # pour que la vérification heuristique puisse en tirer des indices.
-                return secondary_results
-
-        return trusted_results
+        """Recherche multi-passes pour trouver des sources fiables"""
+        logging.info(f"   🔍 Recherche sources fiables: {rumor_text[:80]}...")
+        
+        # Extraire mots-clés pertinents
+        keywords = self._extract_keywords(rumor_text)
+        all_sources = []
+        
+        # PASSE 1: Médias béninois + mots-clés
+        benin_media = ["beninwebtv.com", "lematinal.bj", "lanation.bj", "24haubenin.info", "ortb.bj"]
+        query1 = f'{keywords} ({" OR ".join([f"site:{d}" for d in benin_media])})'
+        results1 = self.searcher.search(query1, num_results=8)
+        all_sources.extend(results1)
+        
+        # PASSE 2: Sites officiels
+        if len(all_sources) < 5:
+            official = ["gouv.bj", "presidence.bj"]
+            query2 = f'{keywords} ({" OR ".join([f"site:{d}" for d in official])})'
+            results2 = self.searcher.search(query2, num_results=5)
+            all_sources.extend(results2)
+        
+        # PASSE 3: Recherche large avec contexte
+        if len(all_sources) < 3:
+            query3 = f'{keywords} Bénin (officiel OR confirmé OR démenti OR annonce)'
+            results3 = self.searcher.search(query3, num_results=10)
+            all_sources.extend(results3)
+        
+        logging.info(f"   📊 {len(all_sources)} sources trouvées")
+        return all_sources[:10]  # Max 10 sources
     
-    def verify_with_gemini(self, rumor_text: str, trusted_sources: List[Dict]) -> Dict:
-        """Vérifie la rumeur avec Gemini"""
-        if not GEMINI_AVAILABLE or not self.api_key:
-            return self._fallback_verification(rumor_text, trusted_sources)
-        
-        evidence = "\n".join([
-            f"- [{s.get('displayLink')}] {s.get('title')} : {s.get('snippet')}"
-            for s in trusted_sources[:5]
-        ])
-        
-        prompt = f"""Tu es un fact-checker expert au Bénin.
+    # ==========================================
+    # EXTRACTION DE MOTS-CLÉS
+    # ==========================================
 
-        RUMEUR À VÉRIFIER:
-        \"{rumor_text}\"
-
-        SOURCES FIABLES TROUVÉES:
-        {evidence if evidence else "(Aucune source fiable trouvée)"}
-
-        INSTRUCTIONS:
-        - Si les sources montrent clairement que la rumeur est vraie → verdict: VRAI
-        - Si les sources montrent clairement que la rumeur est fausse → verdict: FAUX
-        - Si les sources ne contiennent pas assez d'information pour trancher, tu **dois utiliser tes connaissances récentes sur l'actualité politique au Bénin** pour décider si la rumeur est vraisemblable ou fausse.
-
-        - Fournis un score de véracité de 0.0 à 1.0 (0 = totalement faux, 1 = totalement vrai)
-        - Fournis les sources utilisées (même partielles) et une explication concise
-        - Réponds uniquement en JSON
-
-        EXEMPLE DE RÉPONSE JSON:
-        {{
-        "verdict": "VRAI",
-        "score_veracite": 0.8,
-        "explication": "La majorité des sources fiables confirment les faits, ou mes connaissances sur l'actualité récente corroborent la rumeur.",
-        "sources_utilisees": ["url1", "url2"],
-        "recommandation": "Vérification humaine recommandée"
-        }}
+    def _extract_keywords(self, text: str) -> str:
         """
+        Extraction intelligente des mots-clés.
+        Utilise Gemini si disponible, sinon fallback simple.
+        """
+        # Si Gemini n’est pas dispo
+        if not self.gemini_available:
+            # Fallback simple : garder mots > 4 lettres
+            tokens = re.findall(r"\b\w+\b", text.lower())
+            filtered = [t for t in tokens if len(t) > 4]
+            return " ".join(filtered[:6])  # max 6 mots
 
-        
         try:
             model = genai.GenerativeModel("gemini-1.5-flash")
+            prompt = f"""
+            Extrait les mots-clés principaux de ce texte.
+            Retourne UNIQUEMENT une liste de 3 à 7 mots-clés séparés par des espaces.
+
+            Texte :
+            {text}
+            """
             response = model.generate_content(prompt)
-            text = response.text.strip()
+            keywords = response.text.strip()
+
+
+            # Nettoyage
+            keywords = re.sub(r"[^a-zA-Z0-9À-ÿ \-]", "", keywords)
+            return keywords
+
+        except:
+            # Si Gemini crashe, fallback simple
+            tokens = re.findall(r"\b\w+\b", text.lower())
+            filtered = [t for t in tokens if len(t) > 4]
+            return " ".join(filtered[:6])
+
+
+    # ==========================================
+    # ÉTAPE 2: FETCH COMPLET DES PAGES
+    # ==========================================
+    
+    def fetch_full_content(self, url: str) -> Optional[str]:
+        """
+        Récupère le contenu COMPLET d'une page web
+        (pas juste le snippet Google)
+        """
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (compatible; FactCheckBot/1.0)',
+                'Accept': 'text/html,application/xhtml+xml',
+                'Accept-Language': 'fr-FR,fr;q=0.9,en;q=0.8'
+            }
             
-            if text.startswith("```json"):
-                text = text.replace("```json", "").replace("```", "").strip()
+            response = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
+            response.raise_for_status()
             
-            import re
-            match = re.search(r'\{.*\}', text, re.DOTALL)
-            if match:
-                result = json.loads(match.group(0))
-                result["date_verification"] = datetime.now(timezone.utc).isoformat()
-                result["nb_sources_fiables"] = len(trusted_sources)
-                return result
-            else:
-                raise ValueError("No JSON in response")
+            # Parser avec BeautifulSoup
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Extraire le texte de l'article (supprimer scripts, styles, etc.)
+            for script in soup(["script", "style", "nav", "footer", "header"]):
+                script.decompose()
+            
+            # Récupérer le texte principal
+            text = soup.get_text(separator=' ', strip=True)
+            
+            # Nettoyer
+            text = re.sub(r'\s+', ' ', text)
+            text = text[:8000]  # Limiter à 8000 caractères (pour Gemini)
+            
+            logging.info(f"      ✅ Fetché: {len(text)} caractères de {url[:50]}...")
+            return text
         
         except Exception as e:
-            logging.error(f"Gemini verification error: {e}")
-            return self._fallback_verification(rumor_text, trusted_sources)
+            logging.warning(f"      ⚠️ Erreur fetch {url[:50]}: {e}")
+            return None
     
-    def _fallback_verification(self, rumor_text: str, sources: List[Dict]) -> Dict:
-        """Vérification simple sans Gemini"""
-        if not sources:
-            return {
-                "verdict": "INCERTAIN",
-                "score_veracite": 0.0,
-                "explication": "Aucune source fiable trouvée.",
-                "sources_utilisees": [],
-                "recommandation": "Enquête manuelle nécessaire",
-                "nb_sources_fiables": 0
-            }
+    def fetch_all_sources(self, sources: List[Dict]) -> List[Dict]:
+        """Fetch le contenu complet de toutes les sources"""
+        enriched_sources = []
         
-        combined_text = " ".join([s.get("snippet", "") + " " + s.get("title", "") for s in sources]).lower()
+        for src in sources[:5]:  # Limiter à 5 pour éviter trop de requêtes
+            url = src.get("link", "")
+            if not url:
+                continue
+            
+            full_content = self.fetch_full_content(url)
+            
+            enriched_sources.append({
+                "url": url,
+                "domain": src.get("displayLink", ""),
+                "title": src.get("title", ""),
+                "snippet": src.get("snippet", ""),
+                "full_content": full_content or src.get("snippet", "")  # Fallback sur snippet
+            })
+        
+        return enriched_sources
+    
 
-        # Mots-clés plus larges pour détecter confirmation/démenti
-        negative_indicators = ["faux", "démenti", "refute", "réfute", "infirme"]
-        positive_indicators = ["confirmé", "officiel", "communiqué", "mise au point", "confirmes"]
-
-        if any(term in combined_text for term in negative_indicators):
-            verdict = "FAUX"
-            score = 0.2
-        elif any(term in combined_text for term in positive_indicators):
-            verdict = "VRAI"
-            score = 0.8
+    def _fallback_verification(self, rumor_text: str, trusted_sources: List[Dict]) -> Dict:
+        """
+        Fallback simple si Gemini n'est pas dispo ou erreur
+        Basé sur la présence de mots-clés dans les snippets
+        """
+        positive_indicators = ["confirmé", "vrai", "officiel", "annoncé"]
+        negative_indicators = ["démenti", "faux", "infondé", "réfute"]
+        
+        score = 0
+        for src in trusted_sources:
+            snippet = src.get("snippet", "").lower()
+            if any(word in snippet for word in positive_indicators):
+                score += 1
+            if any(word in snippet for word in negative_indicators):
+                score -= 1
+        
+        if score > 0:
+            verdict = "vrai"
+            confidence = min(0.5 + 0.1 * score, 0.9)
+        elif score < 0:
+            verdict = "faux"
+            confidence = min(0.5 + 0.1 * abs(score), 0.9)
         else:
-            verdict = "INCERTAIN"
-            score = 0.5
+            verdict = "non vérifiable"
+            confidence = 0.5
+        
+        logging.info(f"   ✅ Fallback verdict: {verdict} (score: {confidence:.2f})")
         
         return {
             "verdict": verdict,
-            "score_veracite": score,
-            "explication": f"Analyse basée sur {len(sources)} source(s) fiable(s).",
-            "sources_utilisees": [s.get("link") for s in sources],
-            "recommandation": "Vérification humaine recommandée",
-            "nb_sources_fiables": len(sources)
+            "confidence": confidence,
+            "reasoning": "Analyse basée sur les snippets des sources fiables.",
+            "sources_used": trusted_sources,
         }
+    
 
+
+    def extract_json(self, text: str) -> dict | None:
+        """
+        Essaie d'extraire le JSON depuis un texte brut renvoyé par Gemini.
+        Retourne None si aucun JSON valide n'est trouvé.
+        """
+        # Nettoyer guillemets typographiques si jamais
+        text = text.replace("“", '"').replace("”", '"')
+        
+        # Extraire le premier bloc JSON { ... }
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if not match:
+            return None
+        
+        json_text = match.group(0)
+        
+        try:
+            return json.loads(json_text)
+        except json.JSONDecodeError:
+            return None
+
+    
+    # ==========================================
+    # ÉTAPE 3: VÉRIFICATION AVEC GEMINI
+    # ==========================================
+    
+    def verify_with_gemini(self, rumor_text: str, trusted_sources: List[Dict]) -> Dict:
+        """
+        Vérification intelligente avec Gemini
+        Analyse le CONTENU COMPLET des sources et utilise le résumé JSON de Gemini pour décider.
+        """
+        if not self.gemini_available:
+            logging.warning("⚠️ Gemini non disponible, utilisation fallback")
+            return self._fallback_verification(rumor_text, trusted_sources)
+        
+        # Étape 1: Fetch le contenu complet
+        logging.info("📥 Fetch du contenu complet des sources...")
+        enriched_sources = self.fetch_all_sources(trusted_sources)
+        
+        if not enriched_sources:
+            logging.warning("⚠️ Aucun contenu récupéré")
+            return self._fallback_verification(rumor_text, trusted_sources)
+        
+        # Étape 2: Préparer le contexte pour Gemini
+        context = self._build_context(enriched_sources)
+        
+        # Étape 3: Construire le prompt intelligent
+        prompt = self._build_intelligent_prompt(rumor_text, context)
+        
+        try:
+            # Appel de Gemini 2.0
+            model = genai.GenerativeModel("gemini-2.0-flash")
+            logging.info("🤖 Appel Gemini pour analyse...")
+            response = model.generate_content(prompt)
+            text = response.text.strip()
+            print(text)  # Pour debug
+            # Étape 4: Parser le JSON renvoyé par Gemini
+            try:
+                gemini_result = self.extract_json(text)
+            except json.JSONDecodeError:
+                logging.warning("⚠️ Réponse Gemini non JSON, fallback utilisé")
+                return self._fallback_verification(rumor_text, enriched_sources)
+            
+
+            score = gemini_result.get("score_veracite", 0.5)
+            if score <= 0.49:
+                verdict = "FAUX"
+            elif score == 0.5:
+                verdict = "INCERTAIN"
+            else:  # 0.51 <= score <= 1
+                verdict = "VRAI"
+            
+            # Étape 5: Construire le résultat final
+            result = {
+                "verdict": verdict,
+                "score_veracite": gemini_result.get("score_veracite", 0.5),
+                "explication": gemini_result.get("explication", ""),
+                "sources_utilisees": gemini_result.get("sources_utilisees", []),
+                "elements_cles": gemini_result.get("elements_cles", []),
+                "recommandation": gemini_result.get("recommandation", "")
+            }
+            
+            logging.info(f"✅ Gemini verdict: {result['verdict']} (score: {result['score_veracite']:.2f})")
+            return result
+        
+        except Exception as e:
+            logging.error(f"❌ Erreur Gemini: {e}")
+            return self._fallback_verification(rumor_text, trusted_sources)
+
+    
+    # ==========================================
+    # PROMPT INTELLIGENT POUR GEMINI
+    # ==========================================
+    
+    def _build_intelligent_prompt(self, rumor_text: str, context: str) -> str:
+        """
+        Construit un prompt pour Gemini 2.0 Flash qui :
+        - Résume le contenu complet des sources
+        - Vérifie la véracité de la rumeur
+        - Fournit un verdict clair et justifié
+        """
+        current_year = datetime.now().year
+
+        return f"""Tu es un fact-checker expert spécialisé dans les rumeurs au Bénin. 
+
+            RUMEUR À VÉRIFIER:
+            "{rumor_text}"
+
+            CONTEXTE (sources fiables analysées):
+            {context}
+
+            OBJECTIFS:
+            1. Résumer le contenu principal des sources pour chaque point clé.
+            2. Vérifier la véracité de la rumeur selon les informations disponibles.
+            3. Tenir compte du contexte temporel et légal (dates, événements passés, Constitution, annonces officielles).
+            4. Identifier tout élément contradictoire ou incertain.
+
+            FORMAT STRICT:
+            Renvoie uniquement un JSON avec les champs suivants :
+
+            {{
+            "verdict": "VRAI/FAUX/INCERTAIN",
+            "score_veracite": 0.0-1.0,
+            "resume_sources": ["Résumé clair de chaque source analysée"],
+            "explication": "Analyse détaillée justifiant le verdict",
+            "sources_utilisees": ["liste des URLs pertinentes"],
+            "elements_cles": ["points clés extraits des sources"],
+            "recommandation": "Conseil/action à prendre"
+            }}
+
+            EXEMPLE :
+            {{
+            "verdict": "FAUX",
+            "score_veracite": 0.2,
+            "resume_sources": ["Article 1: info 2021...", "Article 2: annonce démentie..."],
+            "explication": "Aucune source ne confirme la rumeur pour 2026. Sources disponibles concernent 2021.",
+            "sources_utilisees": ["URL1", "URL2"],
+            "elements_cles": ["Articles 2021", "Pas d'annonce 2026"],
+            "recommandation": "Rumeur infondée"
+            }}
+        """
+
+    
+    def _build_context(self, enriched_sources: List[Dict]) -> str:
+        """Construit le contexte avec le CONTENU COMPLET des sources"""
+        context_parts = []
+        
+        for i, src in enumerate(enriched_sources, 1):
+            context_parts.append(f"""
+                SOURCE {i}: {src['domain']}
+                URL: {src['url']}
+                TITRE: {src['title']}
+                CONTENU:
+                {src['full_content'][:2000]}...
+                ---
+            """)
+        
+        return
 
 # ==========================================
 # SYSTÈME PRINCIPAL
@@ -660,7 +860,7 @@ class CorrectRumorDetectionSystem:
         self.extractor = RumorExtractor()
         self.deduplicator = RumorDeduplicator()
         self.virality_scorer = ViralityScorer()
-        self.fact_checker = FactChecker(Config.GEMINI_API_KEY, self.web_searcher)
+        self.fact_checker = ImprovedFactChecker(Config.GEMINI_API_KEY, self.web_searcher)
         self.debug = debug
     
     def run_detection_cycle(self, max_queries: int = 10) -> List[Dict]:
