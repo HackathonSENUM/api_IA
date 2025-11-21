@@ -44,6 +44,7 @@ class Config:
     TRUSTED_SOURCES = [
         # --- Médias béninois principaux ---
         "beninwebtv.com",
+        "beninpolitique.org",
         "lematinal.bj",
         "ortb.bj",
         "lanouvelletribune.info",
@@ -67,6 +68,7 @@ class Config:
 
         # --- Médias panafricains fiables ---
         "rfi.fr",
+        "fr.news.yahoo.com",
         "bbc.com",
         "dw.com",
         "jeuneafrique.com",
@@ -512,36 +514,79 @@ class ImprovedFactChecker:
     # ==========================================
     # ÉTAPE 1: RECHERCHE DE SOURCES FIABLES
     # ==========================================
+
+    def _generate_search_queries(self, rumor_text: str) -> List[str]:
+        """
+        Transforme n'importe quelle rumeur en plusieurs requêtes Google.
+        Utilise :
+        - Extraction de mots-clés (lieux, sujets, personnes)
+        - Reformulations simples
+        - Optionnel : appel à Gemini pour reformuler
+        """
+        # Étape 1: extraction brute de mots importants
+        tokens = re.findall(r"\b\w+\b", rumor_text.lower())
+        keywords = [t for t in tokens if len(t) > 4]
+
+        # Étape 2: requête brute
+        queries = [" ".join(keywords[:6])]
+
+        # Étape 3: créer 2-3 variantes simples
+        queries.append(" ".join(keywords[:6]) + " actualité")
+        queries.append(" ".join(keywords[:6]) + " info")
+        queries.append(" ".join(keywords[:6]) + " rumeur")
+
+        # Étape 4: Option Gemini pour générer 3-5 requêtes alternatives si dispo
+        if self.gemini_available:
+            try:
+                model = genai.GenerativeModel("gemini-2.5-flash")
+                prompt = f"""
+                Reformule la rumeur suivante en 5 requêtes Google optimisées pour rechercher
+                des articles fiables. Ne renvoie que les requêtes, pas de phrases.
+                
+                Rumeur :
+                {rumor_text}
+                """
+                resp = model.generate_content(prompt)
+                for line in resp.text.split("\n"):
+                    q = line.strip("-• ").strip()
+                    if len(q) > 5:
+                        queries.append(q)
+            except Exception:
+                pass
+
+        # Retirer doublons et limiter
+        final_queries = list(dict.fromkeys(queries))
+        return final_queries[:8]
+
     
     def find_trusted_sources(self, rumor_text: str) -> List[Dict]:
-        """Recherche multi-passes pour trouver des sources fiables"""
-        logging.info(f"   🔍 Recherche sources fiables: {rumor_text[:80]}...")
-        
-        # Extraire mots-clés pertinents
-        keywords = self._extract_keywords(rumor_text)
-        all_sources = []
-        
-        # PASSE 1: Médias béninois + mots-clés
-        benin_media = ["beninwebtv.com", "lematinal.bj", "lanation.bj", "24haubenin.info", "ortb.bj"]
-        query1 = f'{keywords} ({" OR ".join([f"site:{d}" for d in benin_media])})'
-        results1 = self.searcher.search(query1, num_results=8)
-        all_sources.extend(results1)
-        
-        # PASSE 2: Sites officiels
-        if len(all_sources) < 5:
-            official = ["gouv.bj", "presidence.bj"]
-            query2 = f'{keywords} ({" OR ".join([f"site:{d}" for d in official])})'
-            results2 = self.searcher.search(query2, num_results=5)
-            all_sources.extend(results2)
-        
-        # PASSE 3: Recherche large avec contexte
-        if len(all_sources) < 3:
-            query3 = f'{keywords} Bénin (officiel OR confirmé OR démenti OR annonce)'
-            results3 = self.searcher.search(query3, num_results=10)
-            all_sources.extend(results3)
-        
-        logging.info(f"   📊 {len(all_sources)} sources trouvées")
-        return all_sources[:10]  # Max 10 sources
+        logging.info(f"🔍 Recherche pour : {rumor_text[:80]}")
+        queries = self._generate_search_queries(rumor_text)
+        logging.info(f"🔑 Requêtes générées : {queries}")
+
+        all_results = []
+
+        for q in queries:
+            try:
+                logging.info(f"📡 Recherche Google : {q}")
+                res = self.searcher.search(q, num_results=10)
+                all_results.extend(res)
+            except Exception as e:
+                logging.warning(f"⚠️ Erreur requête {q}: {e}")
+
+        # Filtrer par sources fiables
+        trusted, partial = [], []
+        for result in all_results:
+            domain = self._extract_domain(result.get("link", ""))
+            if domain in Config.TRUSTED_SOURCES:
+                trusted.append(result)
+            elif domain.endswith(".bj"):
+                partial.append(result)
+
+        final = trusted + partial
+        logging.info(f"📊 Total fiables trouvés : {len(final)}")
+        return final[:10]
+
     
     # ==========================================
     # EXTRACTION DE MOTS-CLÉS
@@ -560,7 +605,7 @@ class ImprovedFactChecker:
             return " ".join(filtered[:6])  # max 6 mots
 
         try:
-            model = genai.GenerativeModel("gemini-1.5-flash")
+            model = genai.GenerativeModel("gemini-2.5-flash")
             prompt = f"""
             Extrait les mots-clés principaux de ce texte.
             Retourne UNIQUEMENT une liste de 3 à 7 mots-clés séparés par des espaces.
@@ -581,7 +626,22 @@ class ImprovedFactChecker:
             tokens = re.findall(r"\b\w+\b", text.lower())
             filtered = [t for t in tokens if len(t) > 4]
             return " ".join(filtered[:6])
+        
 
+    @staticmethod
+    def _extract_domain(url: str) -> str:
+        """Extrait le domaine d'une URL"""
+        if not url:
+            return ""
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(url).hostname or ""
+            host = host.lower()
+            if host.startswith("www."):
+                host = host[4:]
+            return host
+        except Exception:
+            return ""
 
     # ==========================================
     # ÉTAPE 2: FETCH COMPLET DES PAGES
@@ -702,15 +762,320 @@ class ImprovedFactChecker:
         except json.JSONDecodeError:
             return None
 
-    
+
     # ==========================================
-    # ÉTAPE 3: VÉRIFICATION AVEC GEMINI
+    # FONCTION 1: _build_context (CORRECTION)
     # ==========================================
-    
+
+    def _build_context(self, enriched_sources: List[Dict]) -> str:
+        """
+        Construit le contexte avec le CONTENU COMPLET des sources
+        CORRECTION: Retourne maintenant le contexte assemblé
+        """
+        if not enriched_sources:
+            return "Aucune source fiable trouvée."
+        
+        context_parts = []
+        
+        for i, src in enumerate(enriched_sources, 1):
+            # Extraire le contenu (jusqu'à 2500 caractères par source)
+            content = src.get('full_content', '')[:2500]
+            domain = src.get('domain', 'inconnu')
+            url = src.get('url', 'N/A')
+            title = src.get('title', 'Sans titre')
+            
+            context_parts.append(f"""
+    SOURCE {i}: {domain}
+    URL: {url}
+    TITRE: {title}
+    CONTENU:
+    {content}
+    {"..." if len(src.get('full_content', '')) > 2500 else ""}
+    ---
+    """)
+        
+        # CORRECTION CRITIQUE: Joindre et retourner le contexte complet
+        final_context = "\n".join(context_parts)
+        
+        # Log pour debug
+        logging.info(f"📝 Contexte construit: {len(final_context)} caractères, {len(enriched_sources)} sources")
+        
+        return final_context
+
+
+    # ==========================================
+    # FONCTION 2: _build_intelligent_prompt (AMÉLIORATION)
+    # ==========================================
+
+    def _build_intelligent_prompt(self, rumor_text: str, context: str) -> str:
+        """
+        Prompt ULTIME combinant toutes les règles importantes
+        """
+        from datetime import datetime
+        current_year = datetime.now().year
+        num_sources = context.count("SOURCE ")
+        context_length = len(context)
+
+        return f"""Tu es un fact-checker expert spécialisé dans les rumeurs au Bénin.
+
+        RUMEUR À VÉRIFIER:
+        "{rumor_text}"
+
+        SOURCES FIABLES DISPONIBLES ({num_sources} sources, {context_length} caractères):
+        {context}
+
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        ⚠️  RÈGLE ABSOLUE DE COHÉRENCE (PRIORITÉ MAXIMALE)
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        🚫 INTERDICTIONS ABSOLUES:
+        1. Ne JAMAIS mettre verdict "VRAI" si ton explication dit que la rumeur est FAUSSE
+        2. Ne JAMAIS mettre verdict "FAUX" si ton explication dit que la rumeur est VRAIE
+        3. Ne JAMAIS mettre score > 0.6 si tu écris "aucune source ne confirme" ou "rumeur est fausse"
+        4. Ne JAMAIS mettre score < 0.4 si tu écris "sources confirment" ou "information vérifiée"
+        5. Ne JAMAIS dire "aucune source fiable" alors que j'ai fourni {num_sources} sources avec contenu
+        6. Ne JAMAIS laisser de listes vides (resume_sources, sources_utilisees, elements_cles)
+        7. Ne JAMAIS mettre de balises markdown ```json dans la réponse
+        8. Ne JAMAIS dire "je n'ai pas accès aux sources" - elles sont CI-DESSUS
+
+        ✅ OBLIGATION: Verdict, score ET explication doivent être 100% COHÉRENTS
+
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        📋 ÉTAPES OBLIGATOIRES À SUIVRE
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        1. Lis le CONTENU COMPLET de chaque SOURCE ci-dessus ({num_sources} sources)
+        2. Résume ce que dit CHAQUE source individuellement (champ "resume_sources")
+        3. Note les URLs des sources pertinentes (champ "sources_utilisees")
+        4. Extrais les faits clés du contenu (champ "elements_cles")
+        5. Détermine le verdict basé sur le CONTENU RÉEL (pas sur des suppositions)
+        6. Choisis un score COHÉRENT avec ton verdict et ton explication
+
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        📊 GUIDE DE SCORING PRÉCIS
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        ┌─────────────────────────────────────────────────────────────────────┐
+        │ RUMEUR VRAIE → Verdict: "VRAI" + Score 0.70-1.0                    │
+        │                                                                      │
+        │ ✓ Sources CONFIRMENT explicitement la rumeur                        │
+        │ ✓ Annonces officielles ou articles qui ATTESTENT le fait            │
+        │ ✓ Événement mentionné dans plusieurs sources fiables                │
+        │                                                                      │
+        │ Exemple: Rumeur "Réforme électorale annoncée"                      │
+        │          + Sources: "Gouvernement annonce réforme électorale"       │
+        │          → Verdict: VRAI, Score: 0.85                              │
+        └─────────────────────────────────────────────────────────────────────┘
+
+        ┌─────────────────────────────────────────────────────────────────────┐
+        │ RUMEUR FAUSSE → Verdict: "FAUX" + Score 0.0-0.30                   │
+        │                                                                      │
+        │ ✓ Sources DÉMENTENT explicitement la rumeur                         │
+        │ ✓ ABSENCE TOTALE de mention dans toutes les sources fiables         │
+        │ ✓ Sources parlent d'événements récents SANS mentionner la rumeur    │
+        │ ✓ Sources contredisent directement la rumeur                        │
+        │                                                                      │
+        │ Exemple: Rumeur "Palais présidentiel a brûlé"                      │
+        │          + Sources: Conférences au palais récentes, zéro mention feu│
+        │          → Verdict: FAUX, Score: 0.12                              │
+        │                                                                      │
+        │ ⚠️  IMPORTANT: ABSENCE de confirmation = FAUX (pas INCERTAIN!)      │
+        └─────────────────────────────────────────────────────────────────────┘
+
+        ┌─────────────────────────────────────────────────────────────────────┐
+        │ INCERTAIN → Verdict: "INCERTAIN" + Score 0.40-0.60                 │
+        │                                                                      │
+        │ ✓ Sources contradictoires (certaines confirment, d'autres démentent)│
+        │ ✓ Informations partielles ou ambiguës                               │
+        │ ✓ Sources insuffisantes pour trancher définitivement                │
+        │ ✓ Besoin de sources supplémentaires                                 │
+        │                                                                      │
+        │ Exemple: Rumeur "Ministre va démissionner"                         │
+        │          + Sources: Un média dit oui, gouvernement ne confirme pas  │
+        │          → Verdict: INCERTAIN, Score: 0.50                         │
+        └─────────────────────────────────────────────────────────────────────┘
+
+        RÈGLES DE SCORE STRICTES:
+        - Score 0.00-0.30 → verdict DOIT être "FAUX"
+        - Score 0.31-0.49 → verdict DOIT être "FAUX" (rumeur probablement fausse)
+        - Score 0.50 → verdict DOIT être "INCERTAIN"
+        - Score 0.51-0.69 → verdict DOIT être "VRAI" (rumeur probablement vraie)
+        - Score 0.70-1.00 → verdict DOIT être "VRAI"
+
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        ⚠️  PIÈGES À ÉVITER ABSOLUMENT
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        ❌ ERREUR 1: "La rumeur est fausse" + score 0.9
+        ✅ CORRECT: "La rumeur est fausse" + score 0.1-0.2
+
+        ❌ ERREUR 2: "Sources confirment l'information" + score 0.2
+        ✅ CORRECT: "Sources confirment l'information" + score 0.8-0.9
+
+        ❌ ERREUR 3: "Aucune source ne mentionne cet événement" + verdict VRAI
+        ✅ CORRECT: "Aucune source ne mentionne cet événement" + verdict FAUX
+
+        ❌ ERREUR 4: "Sources démentent la rumeur" + score 0.85
+        ✅ CORRECT: "Sources démentent la rumeur" + score 0.1-0.2
+
+        ❌ ERREUR 5: Liste vide dans resume_sources alors que tu as {num_sources} sources
+        ✅ CORRECT: Résumer CHAQUE source individuellement
+
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        🌍 CONTEXTE TEMPOREL
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        - Année actuelle: {current_year}
+        - Vérifie TOUJOURS les DATES dans les sources
+        - Un article de 2021 parlant d'élections 2021 NE concerne PAS une rumeur sur 2026
+        - Une conférence de presse au palais en 2024 PROUVE que le palais n'a pas brûlé en 2024
+
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        📄 FORMAT JSON STRICT
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        {{
+        "verdict": "VRAI/FAUX/INCERTAIN",
+        "score_veracite": 0.0-1.0,
+        "resume_sources": [
+            "SOURCE 1 (nom du média): Résumé de ce que dit l'article...",
+            "SOURCE 2 (nom du média): Résumé de ce que dit l'article...",
+            "SOURCE 3 (nom du média): Résumé de ce que dit l'article..."
+        ],
+        "explication": "Analyse détaillée COHÉRENTE avec le verdict et le score",
+        "sources_utilisees": ["URL1", "URL2", "URL3"],
+        "elements_cles": [
+            "Élément clé 1 extrait du contenu",
+            "Élément clé 2 extrait du contenu",
+            "Élément clé 3 extrait du contenu"
+        ],
+        "recommandation": "Action à prendre basée sur le verdict"
+        }}
+
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        ✅ EXEMPLE COMPLET (RUMEUR FAUSSE)
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        Rumeur: "Le palais présidentiel du Bénin a pris feu récemment"
+
+        Sources analysées:
+        - SOURCE 1: Conférence de presse au Palais de la Marina le 8 février 2024
+        - SOURCE 2: Discours du président au palais le 20 décembre 2024
+        - SOURCE 3: Article Jeune Afrique janvier 2025 sur affaires politiques au palais
+        - Résultat: Aucun article ne mentionne un incendie
+
+        ✅ BONNE RÉPONSE:
+        {{
+        "verdict": "FAUX",
+        "score_veracite": 0.12,
+        "resume_sources": [
+            "SOURCE 1 (Présidence Bénin): Transcription conférence de presse du Président Talon au Palais de la Marina le 8 février 2024. Aucune mention d'incendie.",
+            "SOURCE 2 (Présidence Bénin): Message sur l'état de la Nation prononcé au palais le 20 décembre 2024. Le palais est opérationnel.",
+            "SOURCE 3 (Jeune Afrique): Article du 16 janvier 2025 traitant d'affaires politiques. Mentionne des événements au palais sans aucune référence à un incendie."
+        ],
+        "explication": "La rumeur est fausse. Aucune des trois sources fiables ne mentionne d'incendie au palais présidentiel. Au contraire, plusieurs événements officiels se sont tenus au Palais de la Marina en 2024 et début 2025 (conférence de presse février 2024, discours décembre 2024, affaires politiques janvier 2025), ce qui confirme que le palais est pleinement opérationnel. Un incendie serait un événement majeur qui aurait été largement relayé par les médias.",
+        "sources_utilisees": [
+            "https://presidence.bj/actualite/point-presse/325/",
+            "https://presidence.bj/actualite/discours-interviews/363/",
+            "https://www.jeuneafrique.com/1648428/politique/"
+        ],
+        "elements_cles": [
+            "Événements officiels récents au palais (février et décembre 2024)",
+            "Aucune mention d'incendie dans aucune source fiable",
+            "Palais utilisé normalement pour activités gouvernementales en 2025",
+            "Absence de couverture médiatique d'un tel événement majeur"
+        ],
+        "recommandation": "Rumeur infondée - Ne pas relayer. Démentir si elle se propage."
+        }}
+
+        ❌ MAUVAISE RÉPONSE (INTERDITE):
+        {{
+        "verdict": "VRAI",
+        "score_veracite": 0.9,
+        "explication": "La rumeur est fausse. Aucune source ne confirme...",
+        "resume_sources": [],
+        "sources_utilisees": []
+        }}
+        ☝️ CECI EST STRICTEMENT INTERDIT: verdict/score/explication incohérents + listes vides!
+
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        ✅ EXEMPLE COMPLET (RUMEUR VRAIE)
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        Rumeur: "Réformes constitutionnelles annoncées au Bénin"
+
+        Sources analysées:
+        - SOURCE 1: Article BBC mars 2024 sur réformes constitutionnelles
+        - SOURCE 2: Article La Nation confirmant les réformes
+        - SOURCE 3: Communiqué présidence sur les amendements
+        - Résultat: Toutes les sources confirment les réformes
+
+        ✅ BONNE RÉPONSE:
+        {{
+        "verdict": "VRAI",
+        "score_veracite": 0.88,
+        "resume_sources": [
+            "SOURCE 1 (BBC): Article du 15 mars 2024 annonçant que le gouvernement béninois a présenté des réformes constitutionnelles. Le président Talon déclare vouloir moderniser le système électoral.",
+            "SOURCE 2 (La Nation): Article du 16 mars 2024 confirmant les annonces de réformes. Détails sur les amendements proposés concernant la CENI.",
+            "SOURCE 3 (Présidence Bénin): Communiqué officiel détaillant les réformes constitutionnelles et le calendrier de mise en œuvre."
+        ],
+        "explication": "La rumeur est vraie. Trois sources fiables (BBC, La Nation, Présidence du Bénin) confirment explicitement que des réformes constitutionnelles ont été annoncées au Bénin en mars 2024. Les articles citent des déclarations officielles et détaillent les changements proposés, notamment concernant le système électoral et la CENI. Il s'agit d'une information vérifiée par des sources gouvernementales et des médias reconnus.",
+        "sources_utilisees": [
+            "https://www.bbc.com/afrique/articles/reformes-2024",
+            "https://lanation.bj/actualites/reformes-constitutionnelles",
+            "https://presidence.bj/communiques/reformes"
+        ],
+        "elements_cles": [
+            "Réformes constitutionnelles officiellement annoncées mars 2024",
+            "Confirmé par la Présidence et médias fiables internationaux",
+            "Concerne le système électoral et la CENI",
+            "Sources datées de 2024 (pertinent et récent)"
+        ],
+        "recommandation": "Information confirmée - Peut être relayée en citant les sources officielles"
+        }}
+
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        🔍 AUTO-VÉRIFICATION FINALE (AVANT D'ENVOYER TA RÉPONSE)
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        Pose-toi ces questions:
+
+        1. ✓ Mon verdict correspond-il à mon explication?
+        (Si j'écris "faux", est-ce que verdict = "FAUX"?)
+
+        2. ✓ Mon score correspond-il à mon verdict?
+        (Faux = 0.0-0.3, Incertain = 0.4-0.6, Vrai = 0.7-1.0)
+
+        3. ✓ Ai-je résumé TOUTES les sources fournies?
+        (resume_sources doit avoir {num_sources} éléments)
+
+        4. ✓ Ai-je listé les URLs utilisées?
+        (sources_utilisees ne doit PAS être vide)
+
+        5. ✓ Ai-je extrait des éléments clés concrets?
+        (elements_cles doit contenir des faits précis)
+
+        6. ✓ Mon JSON est-il valide sans balises markdown?
+        (Pas de ```json avant ni ``` après)
+
+        SI UNE SEULE RÉPONSE EST "NON", CORRIGE AVANT D'ENVOYER!
+
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        MAINTENANT, ANALYSE LES {num_sources} SOURCES CI-DESSUS ET RÉPONDS EN JSON.
+        """
+
+
+
+
+    # ==========================================
+    # FONCTION 3: verify_with_gemini (AMÉLIORATION DEBUG)
+    # ==========================================
+
     def verify_with_gemini(self, rumor_text: str, trusted_sources: List[Dict]) -> Dict:
         """
         Vérification intelligente avec Gemini
-        Analyse le CONTENU COMPLET des sources et utilise le résumé JSON de Gemini pour décider.
+        VERSION AMÉLIORÉE avec logs de debug
         """
         if not self.gemini_available:
             logging.warning("⚠️ Gemini non disponible, utilisation fallback")
@@ -724,121 +1089,87 @@ class ImprovedFactChecker:
             logging.warning("⚠️ Aucun contenu récupéré")
             return self._fallback_verification(rumor_text, trusted_sources)
         
-        # Étape 2: Préparer le contexte pour Gemini
+        # Étape 2: Construire le contexte
         context = self._build_context(enriched_sources)
         
-        # Étape 3: Construire le prompt intelligent
+        # DEBUG: Vérifier que le contexte n'est pas vide
+        if not context or context == "Aucune source fiable trouvée.":
+            logging.error("❌ ERREUR: Contexte vide ou invalide!")
+            logging.error(f"   Enriched sources: {len(enriched_sources)}")
+            logging.error(f"   Context: {context[:100]}...")
+            return self._fallback_verification(rumor_text, trusted_sources)
+        
+        logging.info(f"✅ Contexte OK: {len(context)} chars, {len(enriched_sources)} sources")
+        
+        # Étape 3: Construire le prompt
         prompt = self._build_intelligent_prompt(rumor_text, context)
         
+        # DEBUG: Afficher un extrait du prompt
+        logging.info(f"📤 Prompt envoyé à Gemini ({len(prompt)} chars)")
+        logging.info(f"   Extrait: {prompt[:200]}...")
+        
         try:
-            # Appel de Gemini 2.0
-            model = genai.GenerativeModel("gemini-2.0-flash")
-            logging.info("🤖 Appel Gemini pour analyse...")
+            # Appel Gemini
+            model = genai.GenerativeModel("gemini-2.5-flash")
+            logging.info("🤖 Appel Gemini...")
             response = model.generate_content(prompt)
             text = response.text.strip()
-            print(text)  # Pour debug
-            # Étape 4: Parser le JSON renvoyé par Gemini
+            
+            # DEBUG: Afficher la réponse brute
+            logging.info("📥 Réponse Gemini reçue:")
+            logging.info(f"   {text[:300]}...")
+            
+            # Parser le JSON
             try:
                 gemini_result = self.extract_json(text)
-            except json.JSONDecodeError:
-                logging.warning("⚠️ Réponse Gemini non JSON, fallback utilisé")
+                
+                if not gemini_result:
+                    logging.error("❌ Pas de JSON valide dans la réponse")
+                    return self._fallback_verification(rumor_text, enriched_sources)
+                
+                # Vérifier que les champs ne sont pas vides
+                if not gemini_result.get("resume_sources"):
+                    logging.warning("⚠️ resume_sources vide dans la réponse Gemini!")
+                if not gemini_result.get("sources_utilisees"):
+                    logging.warning("⚠️ sources_utilisees vide dans la réponse Gemini!")
+                if not gemini_result.get("elements_cles"):
+                    logging.warning("⚠️ elements_cles vide dans la réponse Gemini!")
+                
+                # Déterminer le verdict final
+                score = gemini_result.get("score_veracite", 0.5)
+                if score <= 0.49:
+                    verdict = "FAUX"
+                elif score == 0.5:
+                    verdict = "INCERTAIN"
+                else:
+                    verdict = "VRAI"
+                
+                # Construire le résultat
+                result = {
+                    "verdict": verdict,
+                    "score_veracite": score,
+                    "explication": gemini_result.get("explication", ""),
+                    "sources_utilisees": gemini_result.get("sources_utilisees", []),
+                    "elements_cles": gemini_result.get("elements_cles", []),
+                    "resume_sources": gemini_result.get("resume_sources", []),
+                    "recommandation": gemini_result.get("recommandation", "")
+                }
+                
+                logging.info(f"✅ Gemini verdict: {result['verdict']} (score: {result['score_veracite']:.2f})")
+                logging.info(f"   {len(result['sources_utilisees'])} sources, {len(result['elements_cles'])} éléments clés")
+                
+                return result
+                
+            except json.JSONDecodeError as e:
+                logging.error(f"❌ Erreur parsing JSON: {e}")
+                logging.error(f"   Texte reçu: {text[:500]}")
                 return self._fallback_verification(rumor_text, enriched_sources)
-            
-
-            score = gemini_result.get("score_veracite", 0.5)
-            if score <= 0.49:
-                verdict = "FAUX"
-            elif score == 0.5:
-                verdict = "INCERTAIN"
-            else:  # 0.51 <= score <= 1
-                verdict = "VRAI"
-            
-            # Étape 5: Construire le résultat final
-            result = {
-                "verdict": verdict,
-                "score_veracite": gemini_result.get("score_veracite", 0.5),
-                "explication": gemini_result.get("explication", ""),
-                "sources_utilisees": gemini_result.get("sources_utilisees", []),
-                "elements_cles": gemini_result.get("elements_cles", []),
-                "recommandation": gemini_result.get("recommandation", "")
-            }
-            
-            logging.info(f"✅ Gemini verdict: {result['verdict']} (score: {result['score_veracite']:.2f})")
-            return result
         
         except Exception as e:
             logging.error(f"❌ Erreur Gemini: {e}")
+            import traceback
+            traceback.print_exc()
             return self._fallback_verification(rumor_text, trusted_sources)
-
-    
-    # ==========================================
-    # PROMPT INTELLIGENT POUR GEMINI
-    # ==========================================
-    
-    def _build_intelligent_prompt(self, rumor_text: str, context: str) -> str:
-        """
-        Construit un prompt pour Gemini 2.0 Flash qui :
-        - Résume le contenu complet des sources
-        - Vérifie la véracité de la rumeur
-        - Fournit un verdict clair et justifié
-        """
-        current_year = datetime.now().year
-
-        return f"""Tu es un fact-checker expert spécialisé dans les rumeurs au Bénin. 
-
-            RUMEUR À VÉRIFIER:
-            "{rumor_text}"
-
-            CONTEXTE (sources fiables analysées):
-            {context}
-
-            OBJECTIFS:
-            1. Résumer le contenu principal des sources pour chaque point clé.
-            2. Vérifier la véracité de la rumeur selon les informations disponibles.
-            3. Tenir compte du contexte temporel et légal (dates, événements passés, Constitution, annonces officielles).
-            4. Identifier tout élément contradictoire ou incertain.
-
-            FORMAT STRICT:
-            Renvoie uniquement un JSON avec les champs suivants :
-
-            {{
-            "verdict": "VRAI/FAUX/INCERTAIN",
-            "score_veracite": 0.0-1.0,
-            "resume_sources": ["Résumé clair de chaque source analysée"],
-            "explication": "Analyse détaillée justifiant le verdict",
-            "sources_utilisees": ["liste des URLs pertinentes"],
-            "elements_cles": ["points clés extraits des sources"],
-            "recommandation": "Conseil/action à prendre"
-            }}
-
-            EXEMPLE :
-            {{
-            "verdict": "FAUX",
-            "score_veracite": 0.2,
-            "resume_sources": ["Article 1: info 2021...", "Article 2: annonce démentie..."],
-            "explication": "Aucune source ne confirme la rumeur pour 2026. Sources disponibles concernent 2021.",
-            "sources_utilisees": ["URL1", "URL2"],
-            "elements_cles": ["Articles 2021", "Pas d'annonce 2026"],
-            "recommandation": "Rumeur infondée"
-            }}
-        """
-
-    
-    def _build_context(self, enriched_sources: List[Dict]) -> str:
-        """Construit le contexte avec le CONTENU COMPLET des sources"""
-        context_parts = []
-        
-        for i, src in enumerate(enriched_sources, 1):
-            context_parts.append(f"""
-                SOURCE {i}: {src['domain']}
-                URL: {src['url']}
-                TITRE: {src['title']}
-                CONTENU:
-                {src['full_content'][:2000]}...
-                ---
-            """)
-        
-        return
 
 # ==========================================
 # SYSTÈME PRINCIPAL
